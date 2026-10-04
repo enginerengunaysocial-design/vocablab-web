@@ -41,6 +41,45 @@ function loadSeedData(): SeedGrade[] {
 
 export const seedData = loadSeedData();
 
+type FallbackState = {
+  catalog: CatalogGrade[];
+  ads: AdConfig[];
+  stats: { today: number; month: number; dayKey: string; monthKey: string };
+};
+
+const fallbackStorePath = process.env.CONTENT_STORE_PATH || path.join(process.cwd(), "content-store.json");
+let fallbackState: FallbackState | null = null;
+
+function defaultFallbackState(): FallbackState {
+  return {
+    catalog: fallbackCatalog(),
+    ads: DEFAULT_ADS.map(ad => ({ ...ad, type: "placeholder", content: "", adsenseClient: "", adsenseSlot: "", videoUrl: "" })),
+    stats: { today: 0, month: 0, dayKey: new Date().toISOString().slice(0, 10), monthKey: new Date().toISOString().slice(0, 7) },
+  };
+}
+
+function getFallbackState() {
+  if (fallbackState) return fallbackState;
+  try {
+    if (fs.existsSync(fallbackStorePath)) {
+      fallbackState = JSON.parse(fs.readFileSync(fallbackStorePath, "utf8")) as FallbackState;
+    }
+  } catch (error) {
+    console.warn("[Content] Fallback store could not be read; using seed data:", error);
+  }
+  fallbackState ??= defaultFallbackState();
+  return fallbackState;
+}
+
+function saveFallbackState() {
+  if (!fallbackState) return;
+  try {
+    fs.writeFileSync(fallbackStorePath, JSON.stringify(fallbackState, null, 2), "utf8");
+  } catch (error) {
+    console.warn("[Content] Fallback store could not be saved:", error);
+  }
+}
+
 export function fallbackCatalog(): CatalogGrade[] {
   return seedData.map((grade, gradeIndex) => ({
     id: gradeIndex + 1,
@@ -100,7 +139,7 @@ async function ensureAds(db: NonNullable<Awaited<ReturnType<typeof getDb>>>) {
 
 export async function getCatalog(): Promise<CatalogGrade[]> {
   const db = await getDb();
-  if (!db || !(await ensureSeeded())) return fallbackCatalog();
+  if (!db || !(await ensureSeeded())) return getFallbackState().catalog;
   const classes = await db.select().from(vocabClasses).orderBy(asc(vocabClasses.grade));
   const units = await db.select().from(vocabUnits).orderBy(asc(vocabUnits.classId), asc(vocabUnits.unitNumber));
   const words = await db.select().from(vocabWords).orderBy(asc(vocabWords.unitId), asc(vocabWords.position), asc(vocabWords.id));
@@ -117,13 +156,21 @@ export async function getCatalog(): Promise<CatalogGrade[]> {
 
 export async function getAds(): Promise<AdConfig[]> {
   const db = await getDb();
-  if (!db || !(await ensureSeeded())) return DEFAULT_ADS.map(ad => ({ ...ad, type: "placeholder", content: "", adsenseClient: "", adsenseSlot: "", videoUrl: "" }));
+  if (!db || !(await ensureSeeded())) return getFallbackState().ads;
   return db.select({ slotKey: adSlots.slotKey, title: adSlots.title, type: adSlots.type, content: adSlots.content, adsenseClient: adSlots.adsenseClient, adsenseSlot: adSlots.adsenseSlot, videoUrl: adSlots.videoUrl }).from(adSlots).orderBy(asc(adSlots.id));
 }
 
 export async function getStats() {
   const db = await getDb();
-  if (!db) return { today: 0, month: 0 };
+  if (!db) {
+    const state = getFallbackState();
+    const today = new Date().toISOString().slice(0, 10);
+    const month = today.slice(0, 7);
+    if (state.stats.dayKey !== today) { state.stats.dayKey = today; state.stats.today = 0; }
+    if (state.stats.monthKey !== month) { state.stats.monthKey = month; state.stats.month = 0; }
+    saveFallbackState();
+    return { today: state.stats.today, month: state.stats.month };
+  }
   const now = new Date();
   const dayKey = now.toISOString().slice(0, 10);
   const monthKey = dayKey.slice(0, 7);
@@ -134,13 +181,35 @@ export async function getStats() {
 
 export async function recordVisit() {
   const db = await getDb();
-  if (!db) return;
+  if (!db) {
+    const state = getFallbackState();
+    const today = new Date().toISOString().slice(0, 10);
+    const month = today.slice(0, 7);
+    if (state.stats.dayKey !== today) { state.stats.dayKey = today; state.stats.today = 0; }
+    if (state.stats.monthKey !== month) { state.stats.monthKey = month; state.stats.month = 0; }
+    state.stats.today += 1;
+    state.stats.month += 1;
+    saveFallbackState();
+    return;
+  }
   const dayKey = new Date().toISOString().slice(0, 10);
   await db.insert(visitStats).values({ dayKey, count: 1 }).onDuplicateKeyUpdate({ set: { count: sql`${visitStats.count} + 1` } });
 }
 
 export async function createUnit(grade: number, name: string) {
-  const db = await getDb(); if (!db) throw new Error("Database is not available");
+  const db = await getDb();
+  if (!db) {
+    const state = getFallbackState();
+    let classRow = state.catalog.find(item => item.grade === grade);
+    if (!classRow) {
+      classRow = { id: Math.max(0, ...state.catalog.map(item => item.id)) + 1, grade, name: `${grade}. Sınıf`, units: [], wordCount: 0 };
+      state.catalog.push(classRow);
+    }
+    const unitId = Math.max(0, ...state.catalog.flatMap(item => item.units.map(unit => unit.id))) + 1;
+    classRow.units.push({ id: unitId, unitNumber: classRow.units.length + 1, name, words: [] });
+    saveFallbackState();
+    return;
+  }
   await ensureSeeded();
   let classRow = (await db.select().from(vocabClasses).where(eq(vocabClasses.grade, grade)).limit(1))[0];
   if (!classRow) {
@@ -153,39 +222,96 @@ export async function createUnit(grade: number, name: string) {
 }
 
 export async function updateUnit(id: number, name: string) {
-  const db = await getDb(); if (!db) throw new Error("Database is not available");
+  const db = await getDb();
+  if (!db) {
+    const unit = getFallbackState().catalog.flatMap(item => item.units).find(item => item.id === id);
+    if (!unit) throw new Error("Unit not found");
+    unit.name = name;
+    saveFallbackState();
+    return;
+  }
   await db.update(vocabUnits).set({ name }).where(eq(vocabUnits.id, id));
 }
 
 export async function deleteUnit(id: number) {
-  const db = await getDb(); if (!db) throw new Error("Database is not available");
+  const db = await getDb();
+  if (!db) {
+    const state = getFallbackState();
+    for (const grade of state.catalog) {
+      const index = grade.units.findIndex(unit => unit.id === id);
+      if (index >= 0) { grade.units.splice(index, 1); grade.units.forEach((unit, unitIndex) => { unit.unitNumber = unitIndex + 1; }); grade.wordCount = grade.units.reduce((sum, unit) => sum + unit.words.length, 0); saveFallbackState(); return; }
+    }
+    throw new Error("Unit not found");
+  }
   await db.delete(vocabWords).where(eq(vocabWords.unitId, id));
   await db.delete(vocabUnits).where(eq(vocabUnits.id, id));
 }
 
 export async function createWord(unitId: number, english: string, meaning: string) {
-  const db = await getDb(); if (!db) throw new Error("Database is not available");
+  const db = await getDb();
+  if (!db) {
+    const state = getFallbackState();
+    const unit = state.catalog.flatMap(item => item.units).find(item => item.id === unitId);
+    if (!unit) throw new Error("Unit not found");
+    const wordId = Math.max(0, ...state.catalog.flatMap(item => item.units.flatMap(entry => entry.words.map(word => word.id)))) + 1;
+    unit.words.push({ id: wordId, english, meaning, position: unit.words.length });
+    const grade = state.catalog.find(item => item.units.some(entry => entry.id === unitId));
+    if (grade) grade.wordCount = grade.units.reduce((sum, entry) => sum + entry.words.length, 0);
+    saveFallbackState();
+    return;
+  }
   const last = (await db.select({ position: vocabWords.position }).from(vocabWords).where(eq(vocabWords.unitId, unitId)).orderBy(desc(vocabWords.position)).limit(1))[0];
   await db.insert(vocabWords).values({ unitId, english, meaning, position: (last?.position ?? -1) + 1 });
 }
 
 export async function updateWord(id: number, english: string, meaning: string) {
-  const db = await getDb(); if (!db) throw new Error("Database is not available");
+  const db = await getDb();
+  if (!db) {
+    const word = getFallbackState().catalog.flatMap(item => item.units.flatMap(unit => unit.words)).find(item => item.id === id);
+    if (!word) throw new Error("Word not found");
+    word.english = english;
+    word.meaning = meaning;
+    saveFallbackState();
+    return;
+  }
   await db.update(vocabWords).set({ english, meaning }).where(eq(vocabWords.id, id));
 }
 
 export async function deleteWord(id: number) {
-  const db = await getDb(); if (!db) throw new Error("Database is not available");
+  const db = await getDb();
+  if (!db) {
+    const state = getFallbackState();
+    for (const grade of state.catalog) for (const unit of grade.units) {
+      const index = unit.words.findIndex(word => word.id === id);
+      if (index >= 0) { unit.words.splice(index, 1); unit.words.forEach((word, wordIndex) => { word.position = wordIndex; }); grade.wordCount = grade.units.reduce((sum, entry) => sum + entry.words.length, 0); saveFallbackState(); return; }
+    }
+    throw new Error("Word not found");
+  }
   await db.delete(vocabWords).where(eq(vocabWords.id, id));
 }
 
 export async function updateClass(id: number, name: string) {
-  const db = await getDb(); if (!db) throw new Error("Database is not available");
+  const db = await getDb();
+  if (!db) {
+    const item = getFallbackState().catalog.find(entry => entry.id === id);
+    if (!item) throw new Error("Class not found");
+    item.name = name;
+    saveFallbackState();
+    return;
+  }
   await db.update(vocabClasses).set({ name }).where(eq(vocabClasses.id, id));
 }
 
 export async function updateAd(input: AdConfig) {
-  const db = await getDb(); if (!db) throw new Error("Database is not available");
+  const db = await getDb();
+  if (!db) {
+    const state = getFallbackState();
+    const index = state.ads.findIndex(ad => ad.slotKey === input.slotKey);
+    if (index < 0) throw new Error("Ad slot not found");
+    state.ads[index] = input;
+    saveFallbackState();
+    return;
+  }
   await ensureAds(db);
   await db.update(adSlots).set({ title: input.title, type: input.type, content: input.content, adsenseClient: input.adsenseClient, adsenseSlot: input.adsenseSlot, videoUrl: input.videoUrl }).where(eq(adSlots.slotKey, input.slotKey));
 }

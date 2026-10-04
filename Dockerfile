@@ -9,4 +9,4 @@ RUN pnpm build
 ENV NODE_ENV=production
 ENV PORT=3000
 EXPOSE 3000
-CMD ["node", "dist/index.js"]
+CMD ["sh", "-c", "if [ -n \"$DATABASE_URL\" ]; then pnpm db:migrate; fi; exec node dist/index.js"]
