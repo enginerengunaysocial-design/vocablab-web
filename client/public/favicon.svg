@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="VocabularyLab">
+  <rect width="64" height="64" rx="14" fill="#c8f169"/>
+  <g fill="none" stroke="#192133" stroke-linecap="round" stroke-width="5">
+    <path d="M17 20h30"/>
+    <path d="M17 31h22"/>
+    <path d="M17 42h14"/>
+  </g>
+</svg>
